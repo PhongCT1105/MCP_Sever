@@ -192,22 +192,65 @@ def train_kd(student, teacher, dataloader, optimizer, scheduler, tokenizer):
       - optimizer/scheduler steps
     """
     # TODO (1 pt): correct train/eval modes for teacher and
+    teacher.eval()
+    student.train()
 
     total_loss = 0.0
 
     for batch in tqdm(dataloader, desc="Distillation"):
         # TODO (2 pts): move only tensor fields to device; keep others (e.g., example_id) as-is
+        def to_device(obj, device):
+            if isinstance(obj, torch.Tensor):
+                return obj.to(device)
+            return obj
+
+        batch = {k: to_device(v, cfg.device) for k, v in batch.items()}
+
 
         # TODO (1 pt): drop fields not accepted by forward (e.g., example_id)
+        def filter_model_inputs(batch):
+            return {
+                k: v for k, v in batch.items()
+                if isinstance(v, torch.Tensor)
+                and k not in ["start_positions", "end_positions", "example_id"]
+            }
 
+
+        model_inputs = filter_model_inputs(batch)
+        start_positions = batch["start_positions"]
+        end_positions = batch["end_positions"]
+
+    
         # TODO (2 pts): teacher forward with no grad
- 
+        with torch.no_grad():
+            teacher_outputs = teacher(**model_inputs)
+            t_start = teacher_outputs.start_logits
+            t_end = teacher_outputs.end_logits
+
 
         # TODO (1 pt): student forward
+        # student forward
+        student_outputs = student(**model_inputs)
+        s_start = student_outputs.start_logits
+        s_end = student_outputs.end_logits
 
         # TODO (3 pts): losses = CE + KL(start/end) with provided kl_loss()
 
+        ce_start = F.cross_entropy(s_start, start_positions)
+        ce_end = F.cross_entropy(s_end, end_positions)
+        ce_loss = 0.5 * (ce_start + ce_end)
+
+        kl_start = kl_loss(s_start, t_start)
+        kl_end = kl_loss(s_end, t_end)
+        kd_loss = 0.5 * (kl_start + kl_end)
+
+        loss = cfg.beta_ce * ce_loss + cfg.alpha_kd * kd_loss
         # TODO (1 pt): optimize (backward, step, scheduler, zero_grad) and accumulate
+        loss.backward()
+        optimizer.step()
+        scheduler.step()
+        optimizer.zero_grad()
+        total_loss += loss.item()
 
     return total_loss / len(dataloader)
 
@@ -254,28 +297,30 @@ def main():
 
     print("Loading models...")
     teacher = AutoModelForQuestionAnswering.from_pretrained(cfg.teacher_model).to(cfg.device)
-    student = AutoModelForQuestionAnswering.from_pretrained(cfg.student_model).to(cfg.device)
+    student_ft = AutoModelForQuestionAnswering.from_pretrained(cfg.student_model).to(cfg.device)
+    student_kd = AutoModelForQuestionAnswering.from_pretrained(cfg.student_model).to(cfg.device)
 
-    optimizer = torch.optim.AdamW(student.parameters(), lr=cfg.lr)
+
+    optimizer = torch.optim.AdamW(student_ft.parameters(), lr=cfg.lr)
     scheduler = get_linear_schedule_with_warmup(optimizer, 0, cfg.epochs * len(train_loader))
 
     print("\n=== Standard Fine-tuning ===")
-    loss_ft = train_standard(student, train_loader, optimizer, scheduler, tokenizer)
+    loss_ft = train_standard(student_ft, train_loader, optimizer, scheduler, tokenizer)
     print(f"Fine-tune loss: {loss_ft:.4f}")
 
-    optimizer = torch.optim.AdamW(student.parameters(), lr=cfg.lr)
+    optimizer = torch.optim.AdamW(student_kd.parameters(), lr=cfg.lr)
     scheduler = get_linear_schedule_with_warmup(optimizer, 0, cfg.epochs * len(train_loader))
 
     print("\n=== Knowledge Distillation ===")
-    loss_kd = train_kd(student, teacher, train_loader, optimizer, scheduler, tokenizer)
+    loss_kd = train_kd(student_kd, teacher, train_loader, optimizer, scheduler, tokenizer)
     print(f"Distillation loss: {loss_kd:.4f}")
 
     print("\nEvaluating fine-tuned student...")
-    scores_ft = evaluate_model(student, tokenizer, val_loader, raw["validation"].select(range(50)))
+    scores_ft = evaluate_model(student_ft, tokenizer, val_loader, raw["validation"].select(range(50)))
     print(scores_ft)
 
     print("\nEvaluating distilled student...")
-    scores_kd = evaluate_model(student, tokenizer, val_loader, raw["validation"].select(range(50)))
+    scores_kd = evaluate_model(student_kd, tokenizer, val_loader, raw["validation"].select(range(50)))
     print(scores_kd)
 
 
